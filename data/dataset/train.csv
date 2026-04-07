@@ -1,0 +1,26 @@
+image_path,attacking_team,pressure_label,next_action
+images/image_1.png,home,0,dribble
+images/image_2.png,home,0,dribble
+images/image_3.png,home,0,long ball
+images/image_4.png,away,0,dribble
+images/image_5.png,away,1,short pass
+images/image_6.png,away,0,dribble
+images/image_7.png,away,0,dribble
+images/image_8.png,away,1,short pass
+images/image_9.png,home,2,short pass
+images/image_10.png,away,1,short pass
+images/image_11.png,home,2,long ball
+images/image_12.png,home,0,dribble
+images/image_13.png,home,2,short pass
+images/image_14.png,home,2,short pass
+images/image_15.png,home,2,short pass
+images/image_16.jpg,away,2,clear
+images/image_17.jpg,away,2,short pass
+images/image_18.jpg,away,0,dribble
+images/image_19.jpg,away,1,long ball
+images/image_20.png,home,1,short pass
+images/image_21.png,away,2,short pass
+images/image_22.png,away,2,clear
+images/image_23.png,away,2,clear
+images/image_24.png,home,2,long ball
+images/image_25.png,home,2,short pass

@@ -7,6 +7,7 @@ import torch
 from PIL import Image, ImageDraw
 
 from detection import run_detection
+from features import extract_features
 from team import differentiate_by_color
 
 
@@ -77,6 +78,22 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
     try:
         detection = run_detection(tmp_path)
         teams = differentiate_by_color(tmp_path, detection, attacking_team if attacking_team else None)
+        features = extract_features(detection, teams)
+
+        model = load_model(checkpoint_path.strip() or None)
+        with torch.no_grad():
+            x = torch.from_numpy(features).float().unsqueeze(0)
+            score = model(x).squeeze().item()
+        pressure_class = score_to_class(score)
+        suggested_action = safest_next_action(pressure_class)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Pressure score", f"{score:.3f}")
+        with col2:
+            st.metric("Pressure class", pressure_class)
+        with col3:
+            st.metric("Safest next action", suggested_action)
 
         overlay = draw_overlay(
             tmp_path,
