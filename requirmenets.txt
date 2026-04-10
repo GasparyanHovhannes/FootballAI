@@ -1,0 +1,7 @@
+# FootAI — locked stack (Python 3.10+)
+torch>=2.0.0
+ultralytics>=8.0.0
+numpy>=1.24.0
+pandas>=2.0.0
+streamlit>=1.28.0
+pillow>=10.0.0

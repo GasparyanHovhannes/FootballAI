@@ -6,17 +6,21 @@ import streamlit as st
 import torch
 from PIL import Image, ImageDraw
 
-from detection import run_detection
-from team import differentiate_by_color
+from footAI.detection import run_detection
+from footAI.features import extract_features
+from footAI.model import PressureMLP, score_to_class
+from footAI.team import differentiate_by_color
+
+DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / "pressure_mlp.pt"
 
 
 def safest_next_action(pressure_class: str) -> str:
     """Suggest safest next action from pressure class (rule-based)."""
     if pressure_class == "Low":
-        return "dribble or short pass"
+        return "sprint, dribble"
     if pressure_class == "Medium":
-        return "short pass"
-    return "clear or long ball"
+        return "pass, cross"
+    return "short pass, clearing"
 
 
 st.set_page_config(page_title="FootAI — Pressure Analytics", layout="centered")
@@ -56,17 +60,29 @@ def draw_overlay(
         )
     return img
 
+
+def load_model() -> PressureMLP:
+    """Load PressureMLP and autoload the default checkpoint when available."""
+    model = PressureMLP()
+    if DEFAULT_CHECKPOINT_PATH.exists():
+        model.load_state_dict(torch.load(DEFAULT_CHECKPOINT_PATH, map_location="cpu"))
+    model.eval()
+    return model
+
+
 team_with_ball = st.radio(
     "Team with the ball (pressure is measured on their ball carrier)",
     ["Auto (detect from ball)", "Home", "Away"],
     horizontal=True,
 )
 attacking_team = None if team_with_ball == "Auto (detect from ball)" else team_with_ball.lower()
-checkpoint_path = st.sidebar.text_input(
-    "Model checkpoint (optional)",
-    value="",
-    help="Path to pressure_mlp.pt. Leave empty for untrained weights.",
-)
+if DEFAULT_CHECKPOINT_PATH.exists():
+    st.sidebar.success(f"Using checkpoint: {DEFAULT_CHECKPOINT_PATH}")
+else:
+    st.sidebar.warning(
+        "No checkpoint found at checkpoints/pressure_mlp.pt. "
+        "Using untrained model (scores are not meaningful)."
+    )
 uploaded = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
 
 if uploaded is not None and (attacking_team is not None or team_with_ball == "Auto (detect from ball)"):
@@ -77,6 +93,22 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
     try:
         detection = run_detection(tmp_path)
         teams = differentiate_by_color(tmp_path, detection, attacking_team if attacking_team else None)
+        features = extract_features(detection, teams)
+
+        model = load_model()
+        with torch.no_grad():
+            x = torch.from_numpy(features).float().unsqueeze(0)
+            score = model(x).squeeze().item()
+        pressure_class = score_to_class(score)
+        suggested_action = safest_next_action(pressure_class)
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Pressure score", f"{score:.3f}")
+        with col2:
+            st.metric("Pressure class", pressure_class)
+        with col3:
+            st.metric("Safest next action", suggested_action)
 
         overlay = draw_overlay(
             tmp_path,
@@ -84,7 +116,7 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
             teams.defending_boxes,
             detection.ball_box,
         )
-        st.image(overlay, caption="Green: team with the ball (pressure on their carrier). Red: opponents applying pressure. Blue: ball.", use_container_width=True)
+        st.image(overlay, use_container_width=True)
     except Exception as e:
         st.error(f"Error: {e}")
     finally:
