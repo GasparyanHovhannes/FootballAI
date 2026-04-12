@@ -22,9 +22,6 @@ def score_to_class(score: float) -> PressureClass:
 
 
 class PressureMLP(nn.Module):
-    """
-    MLP: input (spatial features) -> hidden layers -> 1 output with Sigmoid (pressure score in [0, 1]).
-    """
 
     def __init__(
         self,
