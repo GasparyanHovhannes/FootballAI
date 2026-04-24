@@ -14,6 +14,8 @@ class TeamDifferentiationResult:
     """Players partitioned into attacking and defending by spatial heuristic."""
     attacking_boxes: List[BoundingBox]
     defending_boxes: List[BoundingBox]
+    goalkeeper_boxes: List[BoundingBox]
+    referee_boxes: List[BoundingBox]
 
 
 def _player_center_x(box: BoundingBox) -> float:
@@ -55,19 +57,6 @@ def differentiate(
     detection: DetectionResult,
     attacking_team: AttackingTeam,
 ) -> TeamDifferentiationResult:
-    """
-    Label each player as attacking or defending using ball position and attacking_team.
-
-    Convention: "home" attacks toward higher x (right side of image), "away" toward lower x (left).
-    A player is attacking if they are on the attacking side of the ball (by center x).
-
-    Args:
-        detection: YOLO result with player_boxes and optional ball_box.
-        attacking_team: "home" or "away".
-
-    Returns:
-        TeamDifferentiationResult with attacking_boxes and defending_boxes.
-    """
     ref_x = _ball_reference_x(detection)
     attacking_boxes: List[BoundingBox] = []
     defending_boxes: List[BoundingBox] = []
@@ -86,6 +75,8 @@ def differentiate(
     return TeamDifferentiationResult(
         attacking_boxes=attacking_boxes,
         defending_boxes=defending_boxes,
+        goalkeeper_boxes=[],
+        referee_boxes=[],
     )
 
 
@@ -151,7 +142,27 @@ def differentiate_by_color(
 
     img = _load_image_rgb(image_path)
     colors = np.array([_jersey_color_from_crop(img, b) for b in detection.player_boxes])
-    labels = _kmeans2(colors)
+
+    # Referee heuristic: very dark kit (low brightness)
+    brightness = colors.mean(axis=1)
+    referee_mask = brightness < 45.0
+    referee_boxes = [detection.player_boxes[i] for i in range(len(detection.player_boxes)) if referee_mask[i]]
+
+    # Cluster remaining players into two teams
+    keep_idxs = [i for i in range(len(detection.player_boxes)) if not referee_mask[i]]
+    if len(keep_idxs) < 2:
+        if attacking_team is None:
+            attacking_team = "home"
+        base = differentiate(detection, attacking_team)
+        return TeamDifferentiationResult(
+            attacking_boxes=base.attacking_boxes,
+            defending_boxes=base.defending_boxes,
+            goalkeeper_boxes=[],
+            referee_boxes=referee_boxes,
+        )
+
+    kept_colors = colors[keep_idxs]
+    kept_labels = _kmeans2(kept_colors)
 
     # Infer attacking = team with the ball (player closest to ball), or use home/away
     if attacking_team is None and _ball_center(detection) is not None:
@@ -159,14 +170,20 @@ def differentiate_by_color(
             range(len(detection.player_boxes)),
             key=lambda i: _dist_to_ball(detection.player_boxes[i], detection),
         )
-        attacking_cluster = int(labels[closest_idx])
+        # If the closest player got filtered as referee, fall back to home/away heuristic.
+        if closest_idx in keep_idxs:
+            attacking_cluster = int(kept_labels[keep_idxs.index(closest_idx)])
+        else:
+            attacking_team = "home"
+            attacking_cluster = 0
     else:
         if attacking_team is None:
             attacking_team = "home"
         mean_x_by_cluster = [0.0, 0.0]
         count = [0, 0]
-        for i, box in enumerate(detection.player_boxes):
-            c = labels[i]
+        for j, i in enumerate(keep_idxs):
+            box = detection.player_boxes[i]
+            c = int(kept_labels[j])
             mean_x_by_cluster[c] += _player_center_x(box)
             count[c] += 1
         for c in range(2):
@@ -177,7 +194,17 @@ def differentiate_by_color(
         else:
             attacking_cluster = 0 if mean_x_by_cluster[0] < mean_x_by_cluster[1] else 1
 
-    attacking_boxes = [detection.player_boxes[i] for i in range(len(detection.player_boxes)) if labels[i] == attacking_cluster]
-    defending_boxes = [detection.player_boxes[i] for i in range(len(detection.player_boxes)) if labels[i] != attacking_cluster]
+    attacking_boxes: List[BoundingBox] = []
+    defending_boxes: List[BoundingBox] = []
+    for j, i in enumerate(keep_idxs):
+        if int(kept_labels[j]) == int(attacking_cluster):
+            attacking_boxes.append(detection.player_boxes[i])
+        else:
+            defending_boxes.append(detection.player_boxes[i])
 
-    return TeamDifferentiationResult(attacking_boxes=attacking_boxes, defending_boxes=defending_boxes)
+    return TeamDifferentiationResult(
+        attacking_boxes=attacking_boxes,
+        defending_boxes=defending_boxes,
+        goalkeeper_boxes=[],
+        referee_boxes=referee_boxes,
+    )

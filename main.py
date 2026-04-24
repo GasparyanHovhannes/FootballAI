@@ -14,13 +14,36 @@ from footAI.team import differentiate_by_color
 DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / "pressure_mlp.pt"
 
 
-def safest_next_action(pressure_class: str) -> str:
+def _center_x(box: object) -> float:
+    return (float(box.x1) + float(box.x2)) / 2.0
+
+
+def _opposite_goalkeeper_seen(attacking_team: Optional[str], ball_box: object, goalkeeper_boxes: list) -> bool:
+    if attacking_team not in ("home", "away"):
+        return False
+    ball_x = _center_x(ball_box)
+    if attacking_team == "away":
+        return any(_center_x(gk) < ball_x for gk in goalkeeper_boxes)
+    return any(_center_x(gk) > ball_x for gk in goalkeeper_boxes)
+
+
+def safest_next_action(
+    pressure_class: str,
+    score: float,
+    attacking_team: Optional[str],
+    ball_box: object,
+    goalkeeper_boxes: list,
+) -> str:
     """Suggest safest next action from pressure class (rule-based)."""
+    if score < 0.15:
+        if goalkeeper_boxes and _opposite_goalkeeper_seen(attacking_team, ball_box, goalkeeper_boxes):
+            return "shoot or dribble"
+        return "sprint or dribble"
     if pressure_class == "Low":
-        return "sprint, dribble"
+        return "dribble or short pass"
     if pressure_class == "Medium":
-        return "pass, cross"
-    return "short pass, clearing"
+        return "short pass"
+    return "clear or long ball"
 
 
 st.set_page_config(page_title="FootAI — Pressure Analytics", layout="centered")
@@ -35,9 +58,11 @@ def draw_overlay(
     image_path: Path,
     attacking_boxes: list,
     defending_boxes: list,
+    goalkeeper_boxes: list,
+    referee_boxes: list,
     ball_box: Optional[object],
 ) -> Image.Image:
-    """Draw bounding boxes on the image: attacking=green, defending=red, ball=blue."""
+    """Draw bounding boxes on the image: attacking=green, defending=red, GK=white, referee=black, ball=blue."""
     img = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(img)
     for box in attacking_boxes:
@@ -52,6 +77,18 @@ def draw_overlay(
             outline="red",
             width=3,
         )
+    for box in goalkeeper_boxes:
+        draw.rectangle(
+            [(box.x1, box.y1), (box.x2, box.y2)],
+            outline="white",
+            width=4,
+        )
+    for box in referee_boxes:
+        draw.rectangle(
+            [(box.x1, box.y1), (box.x2, box.y2)],
+            outline="black",
+            width=4,
+        )
     if ball_box is not None:
         draw.rectangle(
             [(ball_box.x1, ball_box.y1), (ball_box.x2, ball_box.y2)],
@@ -62,7 +99,7 @@ def draw_overlay(
 
 
 def load_model() -> PressureMLP:
-    """Load PressureMLP and autoload the default checkpoint when available."""
+    """Load PressureMLP and auto-load the default checkpoint when available."""
     model = PressureMLP()
     if DEFAULT_CHECKPOINT_PATH.exists():
         model.load_state_dict(torch.load(DEFAULT_CHECKPOINT_PATH, map_location="cpu"))
@@ -92,6 +129,9 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
 
     try:
         detection = run_detection(tmp_path)
+        if detection.ball_box is None:
+            st.warning("No ball detected — it may not be a football match (or the ball is occluded).")
+            st.stop()
         teams = differentiate_by_color(tmp_path, detection, attacking_team if attacking_team else None)
         features = extract_features(detection, teams)
 
@@ -100,7 +140,13 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
             x = torch.from_numpy(features).float().unsqueeze(0)
             score = model(x).squeeze().item()
         pressure_class = score_to_class(score)
-        suggested_action = safest_next_action(pressure_class)
+        suggested_action = safest_next_action(
+            pressure_class=pressure_class,
+            score=float(score),
+            attacking_team=attacking_team,
+            ball_box=detection.ball_box,
+            goalkeeper_boxes=teams.goalkeeper_boxes,
+        )
 
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -114,9 +160,15 @@ if uploaded is not None and (attacking_team is not None or team_with_ball == "Au
             tmp_path,
             teams.attacking_boxes,
             teams.defending_boxes,
+            teams.goalkeeper_boxes,
+            teams.referee_boxes,
             detection.ball_box,
         )
-        st.image(overlay, use_container_width=True)
+        st.image(
+            overlay,
+            caption="Green: team with the ball (pressure on their carrier). Red: opponents applying pressure. White: goalkeeper(s). Black: referee(s). Blue: ball.",
+            use_container_width=True,
+        )
     except Exception as e:
         st.error(f"Error: {e}")
     finally:
