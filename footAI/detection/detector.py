@@ -1,19 +1,30 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 
 from ultralytics import YOLO
 
-# COCO class IDs used by pretrained YOLOv8
-COCO_PERSON = 0
-COCO_SPORTS_BALL = 32
+# Class IDs in the football-players-detection model (Roboflow Universe).
+# Verify against your weights' `model.names` before relying in production.
+CLASS_BALL = 0
+CLASS_GOALKEEPER = 1
+CLASS_PLAYER = 2
+CLASS_REFEREE = 3
+
+DEFAULT_MODEL_PATH = "weights/football_players_v1.pt"
 
 # Cache: one YOLO instance per model_name, loaded once
 _model_cache: Dict[str, YOLO] = {}
 
 
-def get_model(model_name: str = "yolov8n.pt") -> YOLO:
+def get_model(model_name: str = DEFAULT_MODEL_PATH) -> YOLO:
     if model_name not in _model_cache:
+        if not Path(model_name).exists():
+            raise FileNotFoundError(
+                f"YOLO weights not found at {model_name}. "
+                f"Download a football-trained YOLOv8 .pt (e.g. Roboflow Universe "
+                f"'football-players-detection-3zvbc') and place it there."
+            )
         _model_cache[model_name] = YOLO(model_name)
     return _model_cache[model_name]
 
@@ -33,9 +44,10 @@ class BoundingBox:
 
 @dataclass
 class DetectionResult:
-    """Result of running YOLO on an image: player and ball boxes only."""
+    """YOLO output split by class. Goalkeepers are included in player_boxes."""
     player_boxes: List[BoundingBox]
     ball_box: Optional[BoundingBox]
+    referee_boxes: List[BoundingBox] = field(default_factory=list)
 
 
 def _ensure_path(image_input: Union[str, Path]) -> Path:
@@ -47,11 +59,10 @@ def _ensure_path(image_input: Union[str, Path]) -> Path:
 
 def run_detection(
     image_input: Union[str, Path],
-    model_name: str = "yolov8n.pt",
-    conf_threshold: float = 0.25,
-    ball_conf_threshold: float = 0.1,
-    imgsz: int = 960,
-    ball_imgsz: int = 1280,
+    model_name: str = DEFAULT_MODEL_PATH,
+    conf_threshold: float = 0.15,
+    ball_conf_threshold: float = 0.2,
+    imgsz: int = 1280,
 ) -> DetectionResult:
     path = _ensure_path(image_input)
     model = get_model(model_name)
@@ -59,41 +70,42 @@ def run_detection(
         str(path),
         conf=conf_threshold,
         imgsz=imgsz,
-        classes=[COCO_PERSON],
-        verbose=False,
-    )
-    ball_results = model.predict(
-        str(path),
-        conf=ball_conf_threshold,
-        imgsz=ball_imgsz,
-        classes=[COCO_SPORTS_BALL],
         verbose=False,
     )
 
     player_boxes: List[BoundingBox] = []
+    referee_boxes: List[BoundingBox] = []
     ball_box: Optional[BoundingBox] = None
 
-    if results:
-        # Single image -> results[0]
-        r = results[0]
-        if r.boxes is not None:
-            xyxy = r.boxes.xyxy.cpu().numpy()
-            conf = r.boxes.conf.cpu().numpy()
-            for i in range(len(conf)):
-                x1, y1, x2, y2 = xyxy[i].tolist()
-                cf = float(conf[i])
-                player_boxes.append(BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=cf))
+    if not results:
+        return DetectionResult(player_boxes=[], ball_box=None, referee_boxes=[])
 
-    if ball_results:
-        br = ball_results[0]
-        if br.boxes is not None:
-            b_xyxy = br.boxes.xyxy.cpu().numpy()
-            b_conf = br.boxes.conf.cpu().numpy()
-            for i in range(len(b_conf)):
-                x1, y1, x2, y2 = b_xyxy[i].tolist()
-                cf = float(b_conf[i])
-                # Keep highest-confidence ball if multiple
-                if ball_box is None or cf > ball_box.confidence:
-                    ball_box = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=cf)
+    r = results[0]
+    if r.boxes is None:
+        return DetectionResult(player_boxes=[], ball_box=None, referee_boxes=[])
 
-    return DetectionResult(player_boxes=player_boxes, ball_box=ball_box)
+    xyxy = r.boxes.xyxy.cpu().numpy()
+    conf = r.boxes.conf.cpu().numpy()
+    cls = r.boxes.cls.cpu().numpy().astype(int)
+
+    for i in range(len(conf)):
+        x1, y1, x2, y2 = xyxy[i].tolist()
+        cf = float(conf[i])
+        c = int(cls[i])
+        box = BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=cf)
+        if c == CLASS_PLAYER:
+            player_boxes.append(box)
+        elif c == CLASS_REFEREE:
+            referee_boxes.append(box)
+        elif c == CLASS_BALL:
+            if cf < ball_conf_threshold:
+                continue
+            if ball_box is None or cf > ball_box.confidence:
+                ball_box = box
+        # CLASS_GOALKEEPER is intentionally dropped — see TeamDifferentiationResult.
+
+    return DetectionResult(
+        player_boxes=player_boxes,
+        ball_box=ball_box,
+        referee_boxes=referee_boxes,
+    )

@@ -53,6 +53,19 @@ From project root:
 python -m pip install -r requirements.txt
 ```
 
+## Detector weights
+
+The detector uses a football-trained YOLOv8 model that distinguishes `ball / goalkeeper / player / referee` natively (no COCO `person`-vs-`ref` heuristic).
+
+Download the weights once and place them at `weights/football_players_v1.pt`:
+
+- Source: Roboflow Universe project `football-players-detection-3zvbc`
+- Pick a YOLOv8 version → **Download Weights** → save the `.pt`
+
+If the file is missing, `run_detection` raises a `FileNotFoundError` with a hint.
+
+Note: features change with the detector, so retrain the MLP (`python run_train.py`) after switching weights.
+
 ## Train
 
 Train on real CSV data:
@@ -72,22 +85,22 @@ Checkpoint output:
 ## Run App
 
 ```bash
-python -m streamlit run app.py
+python main.py
 ```
 
-In the app:
-- upload an image
-- choose **Team with the ball** (`Auto`, `Home`, `Away`)
-- checkpoint is autoloaded from `checkpoints/pressure_mlp.pt` if it exists
+A Gradio app opens at http://127.0.0.1:7860.
+
+**Image tab:** upload → click **Analyze** → see overlay + pressure metrics.
+
+**Video tab:** upload → click **Process video** → backend samples at 2 fps and plots pressure-over-time. Drag the time slider to inspect any moment; the frame's overlay and metrics update.
+
+Common controls:
+- **Team with the ball** radio (`Auto` / `Home` / `Away`) — pressure is measured on this team's ball carrier.
+- Checkpoint is autoloaded from `checkpoints/pressure_mlp.pt` if present.
 
 Outputs:
-- `Pressure score`
-- `Pressure class`
-- `Safest next action`
-- overlay:
-  - green = team with the ball
-  - red = opponents applying pressure
-  - blue = ball
+- `Pressure score`, `Pressure class`, `Safest next action`
+- Overlay: green = team with the ball; red = opponents; black = referee(s); blue = ball.
 
 ## Notes
 

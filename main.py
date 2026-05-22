@@ -3,8 +3,9 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import cv2
+import gradio as gr
 import numpy as np
-import streamlit as st
+import pandas as pd
 import torch
 from PIL import Image, ImageDraw
 
@@ -14,32 +15,11 @@ from footAI.model import PressureMLP, score_to_class
 from footAI.team import differentiate_by_color
 
 DEFAULT_CHECKPOINT_PATH = Path("checkpoints") / "pressure_mlp.pt"
+SAMPLE_FPS = 2  # how many frames per second of video we analyze for the timeline
 
 
-def _center_x(box: object) -> float:
-    return (float(box.x1) + float(box.x2)) / 2.0
-
-
-def _opposite_goalkeeper_seen(attacking_team: Optional[str], ball_box: object, goalkeeper_boxes: list) -> bool:
-    if attacking_team not in ("home", "away"):
-        return False
-    ball_x = _center_x(ball_box)
-    if attacking_team == "away":
-        return any(_center_x(gk) < ball_x for gk in goalkeeper_boxes)
-    return any(_center_x(gk) > ball_x for gk in goalkeeper_boxes)
-
-
-def safest_next_action(
-    pressure_class: str,
-    score: float,
-    attacking_team: Optional[str],
-    ball_box: object,
-    goalkeeper_boxes: list,
-) -> str:
-    """Suggest safest next action from pressure class (rule-based)."""
+def safest_next_action(pressure_class: str, score: float) -> str:
     if score < 0.15:
-        if goalkeeper_boxes and _opposite_goalkeeper_seen(attacking_team, ball_box, goalkeeper_boxes):
-            return "shoot or dribble"
         return "sprint or dribble"
     if pressure_class == "Low":
         return "dribble or short pass"
@@ -52,51 +32,23 @@ def draw_overlay(
     image_source: Union[Path, Image.Image],
     attacking_boxes: list,
     defending_boxes: list,
-    goalkeeper_boxes: list,
     referee_boxes: list,
     ball_box: Optional[object],
 ) -> Image.Image:
-    """Draw bounding boxes on the image: attacking=green, defending=red, GK=white, referee=black, ball=blue."""
-    if isinstance(image_source, Image.Image):
-        img = image_source.convert("RGB")
-    else:
-        img = Image.open(image_source).convert("RGB")
+    img = image_source.convert("RGB") if isinstance(image_source, Image.Image) else Image.open(image_source).convert("RGB")
     draw = ImageDraw.Draw(img)
     for box in attacking_boxes:
-        draw.rectangle(
-            [(box.x1, box.y1), (box.x2, box.y2)],
-            outline="lime",
-            width=3,
-        )
+        draw.rectangle([(box.x1, box.y1), (box.x2, box.y2)], outline="lime", width=3)
     for box in defending_boxes:
-        draw.rectangle(
-            [(box.x1, box.y1), (box.x2, box.y2)],
-            outline="red",
-            width=3,
-        )
-    for box in goalkeeper_boxes:
-        draw.rectangle(
-            [(box.x1, box.y1), (box.x2, box.y2)],
-            outline="white",
-            width=4,
-        )
+        draw.rectangle([(box.x1, box.y1), (box.x2, box.y2)], outline="red", width=3)
     for box in referee_boxes:
-        draw.rectangle(
-            [(box.x1, box.y1), (box.x2, box.y2)],
-            outline="black",
-            width=4,
-        )
+        draw.rectangle([(box.x1, box.y1), (box.x2, box.y2)], outline="black", width=4)
     if ball_box is not None:
-        draw.rectangle(
-            [(ball_box.x1, ball_box.y1), (ball_box.x2, ball_box.y2)],
-            outline="blue",
-            width=4,
-        )
+        draw.rectangle([(ball_box.x1, ball_box.y1), (ball_box.x2, ball_box.y2)], outline="blue", width=4)
     return img
 
 
 def load_model() -> PressureMLP:
-    """Load PressureMLP and auto-load the default checkpoint when available."""
     model = PressureMLP()
     if DEFAULT_CHECKPOINT_PATH.exists():
         model.load_state_dict(torch.load(DEFAULT_CHECKPOINT_PATH, map_location="cpu"))
@@ -108,10 +60,6 @@ def analyze_frame_path(
     frame_path: Path,
     attacking_team: Optional[str],
 ) -> Tuple[object, object, np.ndarray, float, str, str, Image.Image]:
-    """
-    Run detection → teams → features → model → overlay.
-    Returns (detection, teams, features, score, pressure_class, suggested_action, overlay_pil).
-    """
     detection = run_detection(frame_path)
     if detection.ball_box is None:
         raise ValueError("NO_BALL")
@@ -122,201 +70,224 @@ def analyze_frame_path(
         x = torch.from_numpy(features).float().unsqueeze(0)
         score = float(model(x).squeeze().item())
     pressure_class = score_to_class(score)
-    suggested_action = safest_next_action(
-        pressure_class=pressure_class,
-        score=score,
-        attacking_team=attacking_team,
-        ball_box=detection.ball_box,
-        goalkeeper_boxes=teams.goalkeeper_boxes,
-    )
+    suggested_action = safest_next_action(pressure_class=pressure_class, score=score)
     overlay = draw_overlay(
         frame_path,
         teams.attacking_boxes,
         teams.defending_boxes,
-        teams.goalkeeper_boxes,
         teams.referee_boxes,
         detection.ball_box,
     )
     return detection, teams, features, score, pressure_class, suggested_action, overlay
 
 
-def _read_video_frame(video_path: Path, frame_index: int) -> Optional[np.ndarray]:
-    """Return BGR frame (OpenCV convention) or None."""
-    cap = cv2.VideoCapture(str(video_path))
+def _team_to_internal(team_choice: str) -> Optional[str]:
+    return None if team_choice == "Auto" else team_choice.lower()
+
+
+def analyze_image(image_path: Optional[str], team_choice: str):
+    """Image tab: upload → overlay + metrics."""
+    if image_path is None:
+        return None, "—", "—", "—"
+    try:
+        _, _, _, score, pclass, action, overlay = analyze_frame_path(Path(image_path), _team_to_internal(team_choice))
+        return overlay, f"{score:.3f}", pclass, action
+    except ValueError as e:
+        if str(e) == "NO_BALL":
+            return None, "—", "No ball detected", "—"
+        raise
+
+
+def process_video(video_path: Optional[str], team_choice: str, progress=gr.Progress()):
+    if video_path is None:
+        return None, None, gr.update(maximum=1.0, value=0.0), "No video uploaded."
+
+    team = _team_to_internal(team_choice)
+    cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
-        return None
-    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-    if n <= 0:
+        return None, None, gr.update(maximum=1.0, value=0.0), "Could not open video."
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+    if n_frames <= 0 or fps <= 0:
         cap.release()
-        return None
-    frame_index = int(np.clip(frame_index, 0, n - 1))
-    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-    ok, frame = cap.read()
+        return None, None, gr.update(maximum=1.0, value=0.0), "Could not read video metadata."
+
+    step = max(1, int(round(fps / SAMPLE_FPS)))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="footai_vid_"))
+    rows = []
+    sample_indices = list(range(0, n_frames, step))
+    total = len(sample_indices)
+
+    for k, frame_idx in enumerate(sample_indices):
+        progress(k / total, desc=f"Analyzing frame {k + 1}/{total}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ok, frame_bgr = cap.read()
+        if not ok:
+            continue
+        t = frame_idx / fps
+        frame_path = tmp_dir / f"f_{frame_idx:06d}.jpg"
+        cv2.imwrite(str(frame_path), frame_bgr)
+        try:
+            _, _, _, score, pclass, _, _ = analyze_frame_path(frame_path, team)
+            rows.append({"time": float(t), "score": float(score), "class": pclass, "frame_path": str(frame_path)})
+        except ValueError as e:
+            if str(e) == "NO_BALL":
+                rows.append({"time": float(t), "score": None, "class": "No ball", "frame_path": str(frame_path)})
+            else:
+                rows.append({"time": float(t), "score": None, "class": "Error", "frame_path": str(frame_path)})
+
     cap.release()
-    if not ok or frame is None:
-        return None
-    return frame
+    df = pd.DataFrame(rows)
+    duration = float(df["time"].max()) if not df.empty else 0.0
+
+    valid = df.dropna(subset=["score"])
+    if not valid.empty:
+        init_time = float(valid.loc[valid["score"].idxmax(), "time"])
+    else:
+        init_time = 0.0
+
+    plot_df = df.dropna(subset=["score"])[["time", "score"]]
+    n_valid = len(plot_df)
+    status = f"Processed {total} frames, {n_valid} with a detected ball."
+
+    return df, plot_df, gr.update(maximum=duration, value=init_time, step=0.5), status
 
 
-def _bgr_to_rgb_display(frame_bgr: np.ndarray) -> np.ndarray:
-    return cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+def on_plot_click(evt: gr.SelectData):
+    """Click a point on the LinePlot -> move the slider to that x value."""
+    val = evt.value
+    t = None
+    if isinstance(val, dict):
+        t = val.get("time") or val.get("x")
+    elif isinstance(val, (list, tuple)) and len(val) >= 1:
+        t = val[0]
+    else:
+        t = val
+    try:
+        return float(t)
+    except (TypeError, ValueError):
+        return gr.update()
 
 
-st.set_page_config(page_title="FootAI — Pressure Analytics", layout="centered")
-st.title("FootAI — Pressure Analytics")
-st.write(
-    "We measure **pressure on the player with the ball**. Choose which team has the ball "
-    "(or Auto to detect from the player closest to the ball). Defenders near the ball = pressure on the ball carrier."
-)
+def select_video_frame(df, selected_time: float, team_choice: str):
+    """Re-analyze the sampled frame closest to selected_time and return its overlay + metrics."""
+    if df is None or df.empty:
+        return None, "—", "—", "—"
+    df["_dt"] = (df["time"] - float(selected_time)).abs()
+    row = df.loc[df["_dt"].idxmin()]
+    df.drop(columns=["_dt"], inplace=True, errors="ignore")
+    frame_path = Path(str(row["frame_path"]))
+    if not frame_path.exists():
+        return None, "—", "Frame expired (re-process video)", "—"
+    try:
+        _, _, _, score, pclass, action, overlay = analyze_frame_path(frame_path, _team_to_internal(team_choice))
+        return overlay, f"{score:.3f}", pclass, action
+    except ValueError as e:
+        if str(e) == "NO_BALL":
+            return Image.open(frame_path), "—", "No ball detected", "—"
+        raise
 
-team_with_ball = st.radio(
-    "Team with the ball (pressure is measured on their ball carrier)",
-    ["Auto (detect from ball)", "Home", "Away"],
-    horizontal=True,
-)
-attacking_team = None if team_with_ball == "Auto (detect from ball)" else team_with_ball.lower()
-if DEFAULT_CHECKPOINT_PATH.exists():
-    st.sidebar.success(f"Using checkpoint: {DEFAULT_CHECKPOINT_PATH}")
-else:
-    st.sidebar.warning(
-        "No checkpoint found at checkpoints/pressure_mlp.pt. "
-        "Using untrained model (scores are not meaningful)."
+
+CUSTOM_CSS = """
+.gradio-container { max-width: 980px !important; margin: 0 auto !important; }
+#result-image img { max-height: 520px !important; object-fit: contain; }
+#video-upload video { max-height: 360px !important; }
+.metric-box textarea { text-align: center; font-weight: 600; }
+"""
+
+with gr.Blocks(title="FootAI — Pressure Analytics", css=CUSTOM_CSS, theme=gr.themes.Soft()) as demo:
+    gr.Markdown("# FootAI — Pressure Analytics")
+    gr.Markdown(
+        "Measure **pressure on the player with the ball**. Pick which team has the ball "
+        "(or **Auto** to detect from the player closest to the ball). Defenders near the ball = pressure on the ball carrier."
+    )
+    if not DEFAULT_CHECKPOINT_PATH.exists():
+        gr.Markdown(
+            "**Warning:** no checkpoint at `checkpoints/pressure_mlp.pt`. "
+            "Scores will be from an untrained model and won't be meaningful. Run `python run_train.py` first."
+        )
+
+    team_choice = gr.Radio(
+        choices=["Auto", "Home", "Away"],
+        value="Auto",
+        label="Team with the ball",
     )
 
-input_mode = st.radio("Input", ["Image", "Video (upload)"], horizontal=True)
-
-can_run = attacking_team is not None or team_with_ball == "Auto (detect from ball)"
-
-if input_mode == "Image":
-    uploaded = st.file_uploader("Upload image", type=["jpg", "jpeg", "png"])
-    if uploaded is not None and can_run:
-        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-            tmp.write(uploaded.getvalue())
-            tmp_path = Path(tmp.name)
-        try:
-            try:
-                _, _, _, score, pressure_class, suggested_action, overlay = analyze_frame_path(
-                    tmp_path, attacking_team
-                )
-            except ValueError as e:
-                if str(e) == "NO_BALL":
-                    st.warning("No ball detected — it may not be a football match (or the ball is occluded).")
-                    st.stop()
-                raise
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Pressure score", f"{score:.3f}")
-            with col2:
-                st.metric("Pressure class", pressure_class)
-            with col3:
-                st.metric("Safest next action", suggested_action)
-            st.image(
-                overlay,
-                caption="Green: team with the ball (pressure on their carrier). Red: opponents applying pressure. White: goalkeeper(s). Black: referee(s). Blue: ball.",
-                use_container_width=True,
-            )
-        except Exception as e:
-            st.error(f"Error: {e}")
-        finally:
-            tmp_path.unlink(missing_ok=True)
-
-else:
-    st.caption(
-        "Upload a video file, scrub to the frame you want "
-        "then run FootAI on that single frame."
-    )
-    video_file = st.file_uploader("Upload video", type=["mp4", "webm", "avi", "mov", "mkv"])
-
-    if video_file is not None and can_run:
-        suffix = Path(video_file.name).suffix if video_file.name else ".mp4"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as vtmp:
-            vtmp.write(video_file.getvalue())
-            video_path = Path(vtmp.name)
-
-        try:
-            vid_key = f"{video_file.name}:{video_path.stat().st_size}"
-            if st.session_state.get("video_session_key") != vid_key:
-                st.session_state.video_session_key = vid_key
-                st.session_state["video_frame_slider"] = 0
-
-            cap_probe = cv2.VideoCapture(str(video_path))
-            if not cap_probe.isOpened():
-                st.error("Could not open video file.")
-                st.stop()
-            n_frames = int(cap_probe.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
-            fps = cap_probe.get(cv2.CAP_PROP_FPS) or 0.0
-            cap_probe.release()
-            if n_frames <= 0:
-                st.error("Could not read frame count from this video (codec may be unsupported).")
-                st.stop()
-
-            cur = int(np.clip(int(st.session_state.get("video_frame_slider", 0)), 0, n_frames - 1))
-            st.session_state["video_frame_slider"] = cur
-
-            c_prev, c_slider, c_next, c_analyze = st.columns([1, 6, 1, 2])
-            with c_prev:
-                if st.button("◀", help="Previous frame"):
-                    st.session_state["video_frame_slider"] = max(0, cur - 1)
-                    st.rerun()
-            with c_next:
-                if st.button("▶", help="Next frame"):
-                    st.session_state["video_frame_slider"] = min(n_frames - 1, cur + 1)
-                    st.rerun()
-            with c_slider:
-                st.slider(
-                    "Frame (scrub = pause on a frame)",
-                    0,
-                    n_frames - 1,
-                    key="video_frame_slider",
-                )
-            with c_analyze:
-                analyze_clicked = st.button("Analyze this frame", type="primary", use_container_width=True)
-
-            frame_index = int(np.clip(int(st.session_state["video_frame_slider"]), 0, n_frames - 1))
-            frame_bgr = _read_video_frame(video_path, frame_index)
-            if frame_bgr is None:
-                st.error("Failed to read this frame from the video.")
-                st.stop()
-
-            st.image(
-                _bgr_to_rgb_display(frame_bgr),
-                caption=f"Preview — frame {frame_index + 1}/{n_frames}"
-                + (f" (~{fps:.2f} fps)" if fps > 1e-3 else ""),
-                use_container_width=True,
+    with gr.Tabs():
+        with gr.Tab("Image"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    image_input = gr.Image(type="filepath", label="Upload image", height=320)
+                    image_btn = gr.Button("Analyze", variant="primary", size="lg")
+            image_overlay = gr.Image(label="Result overlay", interactive=False, height=520, elem_id="result-image")
+            with gr.Row():
+                image_score = gr.Textbox(label="Pressure score", interactive=False, elem_classes=["metric-box"])
+                image_class = gr.Textbox(label="Pressure class", interactive=False, elem_classes=["metric-box"])
+                image_action = gr.Textbox(label="Safest next action", interactive=False, elem_classes=["metric-box"])
+            image_btn.click(
+                analyze_image,
+                inputs=[image_input, team_choice],
+                outputs=[image_overlay, image_score, image_class, image_action],
             )
 
-            if analyze_clicked:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as ftmp:
-                    fpath = Path(ftmp.name)
-                try:
-                    cv2.imwrite(str(fpath), frame_bgr)
-                    try:
-                        _, _, _, score, pressure_class, suggested_action, overlay = analyze_frame_path(
-                            fpath, attacking_team
-                        )
-                    except ValueError as e:
-                        if str(e) == "NO_BALL":
-                            st.warning(
-                                "No ball detected on this frame — try another frame or a clearer shot of the ball."
-                            )
-                            st.stop()
-                        raise
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Pressure score", f"{score:.3f}")
-                    with col2:
-                        st.metric("Pressure class", pressure_class)
-                    with col3:
-                        st.metric("Safest next action", suggested_action)
-                    st.image(
-                        overlay,
-                        caption="Green: team with the ball (pressure on their carrier). Red: opponents applying pressure. White: goalkeeper(s). Black: referee(s). Blue: ball.",
-                        use_container_width=True,
-                    )
-                except Exception as e:
-                    st.error(f"Error: {e}")
-                finally:
-                    fpath.unlink(missing_ok=True)
+        with gr.Tab("Video"):
+            with gr.Row():
+                with gr.Column(scale=1):
+                    video_input = gr.Video(label="Upload video", height=360, elem_id="video-upload")
+                    process_btn = gr.Button("Process video", variant="primary", size="lg")
+                    status_md = gr.Markdown("")
 
-        finally:
-            video_path.unlink(missing_ok=True)
+            df_state = gr.State(value=None)
+
+            timeline_plot = gr.LinePlot(
+                value=None,
+                x="time",
+                y="score",
+                x_title="Time (s)",
+                y_title="Pressure score",
+                title="Pressure over time (click a point to jump)",
+                height=260,
+            )
+            time_slider = gr.Slider(
+                minimum=0.0,
+                maximum=1.0,
+                value=0.0,
+                step=0.5,
+                label="Time (s) — drag to inspect a moment",
+                interactive=True,
+            )
+            video_overlay = gr.Image(label="Frame at selected time", interactive=False, height=520, elem_id="result-image")
+            with gr.Row():
+                video_score = gr.Textbox(label="Pressure score", interactive=False, elem_classes=["metric-box"])
+                video_class = gr.Textbox(label="Pressure class", interactive=False, elem_classes=["metric-box"])
+                video_action = gr.Textbox(label="Safest next action", interactive=False, elem_classes=["metric-box"])
+
+            process_btn.click(
+                process_video,
+                inputs=[video_input, team_choice],
+                outputs=[df_state, timeline_plot, time_slider, status_md],
+            ).then(
+                select_video_frame,
+                inputs=[df_state, time_slider, team_choice],
+                outputs=[video_overlay, video_score, video_class, video_action],
+            )
+
+            time_slider.release(
+                select_video_frame,
+                inputs=[df_state, time_slider, team_choice],
+                outputs=[video_overlay, video_score, video_class, video_action],
+            )
+
+            timeline_plot.select(
+                on_plot_click,
+                inputs=None,
+                outputs=time_slider,
+            ).then(
+                select_video_frame,
+                inputs=[df_state, time_slider, team_choice],
+                outputs=[video_overlay, video_score, video_class, video_action],
+            )
+
+
+if __name__ == "__main__":
+    demo.queue().launch()

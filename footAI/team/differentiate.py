@@ -14,7 +14,6 @@ class TeamDifferentiationResult:
     """Players partitioned into attacking and defending by spatial heuristic."""
     attacking_boxes: List[BoundingBox]
     defending_boxes: List[BoundingBox]
-    goalkeeper_boxes: List[BoundingBox]
     referee_boxes: List[BoundingBox]
 
 
@@ -75,8 +74,7 @@ def differentiate(
     return TeamDifferentiationResult(
         attacking_boxes=attacking_boxes,
         defending_boxes=defending_boxes,
-        goalkeeper_boxes=[],
-        referee_boxes=[],
+        referee_boxes=list(detection.referee_boxes),
     )
 
 
@@ -111,23 +109,74 @@ def _jersey_color_from_crop(img: np.ndarray, box: BoundingBox) -> np.ndarray:
     return np.mean(torso.reshape(-1, 3), axis=0).astype(np.float64)
 
 
-def _kmeans2(data: np.ndarray, max_iters: int = 20) -> np.ndarray:
-    """Cluster (N, D) into 2 groups; returns labels (N,) 0 or 1."""
+def _rgb_to_hue_sat_features(rgb_colors: np.ndarray) -> np.ndarray:
+    """(N, 3) RGB in [0, 255] -> (N, 3) (cos H, sin H, S) features.
+
+    Hue is encoded as (cos, sin) so circular distance behaves under Euclidean k-means.
+    Value is dropped because shadows/lighting move it independently of jersey identity.
+    """
+    rgb = rgb_colors.astype(np.float64) / 255.0
+    r, g, b = rgb[:, 0], rgb[:, 1], rgb[:, 2]
+    mx = np.maximum(np.maximum(r, g), b)
+    mn = np.minimum(np.minimum(r, g), b)
+    diff = mx - mn
+    safe_diff = np.where(diff > 1e-8, diff, 1.0)
+    h_r = ((g - b) / safe_diff) % 6.0
+    h_g = ((b - r) / safe_diff) + 2.0
+    h_b = ((r - g) / safe_diff) + 4.0
+    h = np.zeros_like(mx)
+    h = np.where((mx == r) & (diff > 1e-8), h_r, h)
+    h = np.where((mx == g) & (diff > 1e-8), h_g, h)
+    h = np.where((mx == b) & (diff > 1e-8), h_b, h)
+    h = h / 6.0  # [0, 1]
+    s = np.where(mx > 1e-8, diff / mx, 0.0)
+    angle = 2.0 * np.pi * h
+    return np.stack([np.cos(angle), np.sin(angle), s], axis=1)
+
+
+def _kmeans2(data: np.ndarray, max_iters: int = 20, n_inits: int = 10) -> np.ndarray:
+    """Cluster (N, D) into 2 groups with k-means++ init + multiple restarts.
+
+    Returns labels (N,) in {0, 1}. Deterministic (fixed seed).
+    """
     n = data.shape[0]
     if n <= 1:
         return np.zeros(n, dtype=np.int32)
-    c0 = data[0].copy()
-    c1 = data[-1].copy() if n > 1 else data[0].copy()
-    for _ in range(max_iters):
-        d0 = np.linalg.norm(data - c0, axis=1)
-        d1 = np.linalg.norm(data - c1, axis=1)
-        labels = (d1 < d0).astype(np.int32)
-        n0, n1 = labels.sum(), n - labels.sum()
-        if n0 > 0:
-            c0 = data[labels == 0].mean(axis=0)
-        if n1 > 0:
-            c1 = data[labels == 1].mean(axis=0)
-    return labels
+    rng = np.random.default_rng(0)
+
+    best_labels = np.zeros(n, dtype=np.int32)
+    best_inertia = float("inf")
+
+    for _ in range(n_inits):
+        first_idx = int(rng.integers(0, n))
+        c0 = data[first_idx].copy()
+        d2 = np.sum((data - c0) ** 2, axis=1)
+        total = float(d2.sum())
+        if total <= 1e-12:
+            c1 = data[(first_idx + 1) % n].copy()
+        else:
+            probs = d2 / total
+            second_idx = int(rng.choice(n, p=probs))
+            c1 = data[second_idx].copy()
+
+        labels = np.zeros(n, dtype=np.int32)
+        for _ in range(max_iters):
+            d0 = np.linalg.norm(data - c0, axis=1)
+            d1 = np.linalg.norm(data - c1, axis=1)
+            labels = (d1 < d0).astype(np.int32)
+            if (labels == 0).any():
+                c0 = data[labels == 0].mean(axis=0)
+            if (labels == 1).any():
+                c1 = data[labels == 1].mean(axis=0)
+
+        d0 = np.sum((data - c0) ** 2, axis=1)
+        d1 = np.sum((data - c1) ** 2, axis=1)
+        inertia = float(np.minimum(d0, d1).sum())
+        if inertia < best_inertia:
+            best_inertia = inertia
+            best_labels = labels
+
+    return best_labels
 
 
 def differentiate_by_color(
@@ -135,34 +184,22 @@ def differentiate_by_color(
     detection: DetectionResult,
     attacking_team: Optional[AttackingTeam] = None,
 ) -> TeamDifferentiationResult:
+    referee_boxes = list(detection.referee_boxes)
+
     if len(detection.player_boxes) < 2:
-        if attacking_team is None:
-            attacking_team = "home"
-        return differentiate(detection, attacking_team)
-
-    img = _load_image_rgb(image_path)
-    colors = np.array([_jersey_color_from_crop(img, b) for b in detection.player_boxes])
-
-    # Referee heuristic: very dark kit (low brightness)
-    brightness = colors.mean(axis=1)
-    referee_mask = brightness < 45.0
-    referee_boxes = [detection.player_boxes[i] for i in range(len(detection.player_boxes)) if referee_mask[i]]
-
-    # Cluster remaining players into two teams
-    keep_idxs = [i for i in range(len(detection.player_boxes)) if not referee_mask[i]]
-    if len(keep_idxs) < 2:
         if attacking_team is None:
             attacking_team = "home"
         base = differentiate(detection, attacking_team)
         return TeamDifferentiationResult(
             attacking_boxes=base.attacking_boxes,
             defending_boxes=base.defending_boxes,
-            goalkeeper_boxes=[],
             referee_boxes=referee_boxes,
         )
 
-    kept_colors = colors[keep_idxs]
-    kept_labels = _kmeans2(kept_colors)
+    img = _load_image_rgb(image_path)
+    colors = np.array([_jersey_color_from_crop(img, b) for b in detection.player_boxes])
+    features = _rgb_to_hue_sat_features(colors)
+    labels = _kmeans2(features)
 
     # Infer attacking = team with the ball (player closest to ball), or use home/away
     if attacking_team is None and _ball_center(detection) is not None:
@@ -170,20 +207,14 @@ def differentiate_by_color(
             range(len(detection.player_boxes)),
             key=lambda i: _dist_to_ball(detection.player_boxes[i], detection),
         )
-        # If the closest player got filtered as referee, fall back to home/away heuristic.
-        if closest_idx in keep_idxs:
-            attacking_cluster = int(kept_labels[keep_idxs.index(closest_idx)])
-        else:
-            attacking_team = "home"
-            attacking_cluster = 0
+        attacking_cluster = int(labels[closest_idx])
     else:
         if attacking_team is None:
             attacking_team = "home"
         mean_x_by_cluster = [0.0, 0.0]
         count = [0, 0]
-        for j, i in enumerate(keep_idxs):
-            box = detection.player_boxes[i]
-            c = int(kept_labels[j])
+        for i, box in enumerate(detection.player_boxes):
+            c = int(labels[i])
             mean_x_by_cluster[c] += _player_center_x(box)
             count[c] += 1
         for c in range(2):
@@ -196,15 +227,14 @@ def differentiate_by_color(
 
     attacking_boxes: List[BoundingBox] = []
     defending_boxes: List[BoundingBox] = []
-    for j, i in enumerate(keep_idxs):
-        if int(kept_labels[j]) == int(attacking_cluster):
-            attacking_boxes.append(detection.player_boxes[i])
+    for i, box in enumerate(detection.player_boxes):
+        if int(labels[i]) == int(attacking_cluster):
+            attacking_boxes.append(box)
         else:
-            defending_boxes.append(detection.player_boxes[i])
+            defending_boxes.append(box)
 
     return TeamDifferentiationResult(
         attacking_boxes=attacking_boxes,
         defending_boxes=defending_boxes,
-        goalkeeper_boxes=[],
         referee_boxes=referee_boxes,
     )

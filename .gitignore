@@ -5,9 +5,28 @@ __pycache__/
 venv/
 env/
 
-# Project
+# Models & weights
 checkpoints/
+weights/
 *.pt
+*.pth
+*.onnx
 
-# IDE
+# Training artifacts
+runs/
+
+# Dataset images (labels CSV stays tracked)
+footAI/data/dataset/images/
+
+# IDE & tools
 .idea/
+.vscode/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gradio cache
+gradio_cached_examples/
+flagged/
